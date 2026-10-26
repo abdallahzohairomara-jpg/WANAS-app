@@ -1,0 +1,94 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unzip project
+        run: unzip -q social_app_v2.zip
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Generate Android project
+        working-directory: social_app
+        run: flutter create --platforms=android --org com.wanas --project-name social_app .
+
+      - name: Configure Android (permissions, minSdk, name, notification channels)
+        working-directory: social_app
+        run: |
+          python3 - <<'PY'
+          import re, pathlib
+          m = pathlib.Path("android/app/src/main/AndroidManifest.xml")
+          s = m.read_text(encoding="utf-8")
+          perms = "\n".join('    <uses-permission android:name="android.permission.%s"/>' % p for p in
+            ["INTERNET","RECORD_AUDIO","CAMERA","MODIFY_AUDIO_SETTINGS","ACCESS_NETWORK_STATE",
+             "CHANGE_NETWORK_STATE","BLUETOOTH_CONNECT","POST_NOTIFICATIONS"])
+          perms += '\n    <uses-feature android:name="android.hardware.camera" android:required="false"/>'
+          perms += '\n    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false"/>\n'
+          s = s.replace("<application", perms + "    <application", 1)
+          s = re.sub(r'android:label="[^"]*"', 'android:label="ونس"', s, count=1)
+          m.write_text(s, encoding="utf-8")
+          for f in ["android/app/build.gradle.kts", "android/app/build.gradle"]:
+              p = pathlib.Path(f)
+              if p.exists():
+                  t = p.read_text()
+                  t = t.replace("minSdk = flutter.minSdkVersion", "minSdk = 24").replace("minSdkVersion flutter.minSdkVersion", "minSdkVersion 24")
+                  p.write_text(t)
+          src = pathlib.Path("android_setup/MainActivity.kt").read_text(encoding="utf-8")
+          src = src.replace("package com.example.social_app", "package com.wanas.social_app")
+          dst = pathlib.Path("android/app/src/main/kotlin/com/wanas/social_app/MainActivity.kt")
+          dst.parent.mkdir(parents=True, exist_ok=True)
+          dst.write_text(src, encoding="utf-8")
+          PY
+
+      - name: Launcher icons (non-fatal)
+        working-directory: social_app
+        continue-on-error: true
+        run: |
+          flutter pub get
+          dart run flutter_launcher_icons
+
+      - name: Get packages
+        working-directory: social_app
+        run: flutter pub get 2>&1 | tee ../pubget.txt
+
+      - name: Analyze (collect errors, never stops the build)
+        working-directory: social_app
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings > ../analyze.txt 2>&1 || true
+
+      - name: Build debug APK
+        working-directory: social_app
+        run: flutter build apk --debug 2>&1 | tee ../build.txt; exit ${PIPESTATUS[0]}
+
+      - name: Summary of problems (copy this and send it to Claude)
+        if: always()
+        run: |
+          {
+            echo '## Errors'
+            echo '```'
+            grep -h -E "error •|Error:|FAILURE|What went wrong|e: |Could not|Because " analyze.txt build.txt pubget.txt 2>/dev/null | head -80 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wanas-apk-and-logs
+          path: |
+            social_app/build/app/outputs/flutter-apk/app-debug.apk
+            analyze.txt
+            build.txt
+            pubget.txt
